@@ -4,6 +4,7 @@ from __future__ import unicode_literals, division, print_function, absolute_impo
 import inspect
 import re
 import sys
+import io
 from collections import defaultdict
 from importlib import import_module
 from inspect import ArgSpec
@@ -13,7 +14,7 @@ import sqlalchemy
 import sqlalchemy.exc
 from sqlalchemy import (
     Enum, ForeignKeyConstraint, PrimaryKeyConstraint, CheckConstraint, UniqueConstraint, Table,
-    Column, Float)
+    Column, Float, Sequence)
 from sqlalchemy.schema import ForeignKey
 from sqlalchemy.sql.sqltypes import NullType
 from sqlalchemy.types import Boolean, String
@@ -42,6 +43,7 @@ _re_column_name = re.compile(r'(?:(["`]?)(?:.*)\1\.)?(["`]?)(.*)\2')
 _re_enum_check_constraint = re.compile(r"(?:(?:.*?)\.)?(.*?) IN \((.+)\)")
 _re_enum_item = re.compile(r"'(.*?)(?<!\\)'")
 _re_invalid_identifier = re.compile(r'[^a-zA-Z0-9_]' if sys.version_info[0] < 3 else r'(?u)\W')
+_re_sequence_name = re.compile("(?:nextval\(\')(?P<sequence_name>\w+)(?:\'\:\:regclass\))")
 
 
 class _DummyInflectEngine(object):
@@ -152,6 +154,10 @@ class Model(object):
                     collector.add_literal_import('sqlalchemy', 'Computed')
                 else:
                     collector.add_literal_import('sqlalchemy', 'text')
+
+                default_expr = column.server_default.arg.text
+                if "nextval" in default_expr and not column.primary_key:
+                    collector.add_import(Sequence)
 
             if isinstance(column.type, ARRAY):
                 collector.add_import(column.type.item_type.__class__)
@@ -474,6 +480,14 @@ class CodeGenerator(object):
         return str(statement.compile(
             self.metadata.bind, compile_kwargs={"literal_binds": True}))
 
+    def _get_sequence_name(self, expression):
+        match = _re_sequence_name.search(expression)
+        if match:
+            sequence_name = match.group('sequence_name')
+        else:
+            sequence_name = None
+        return sequence_name
+
     @staticmethod
     def _getargspec_init(method):
         try:
@@ -560,6 +574,10 @@ class CodeGenerator(object):
             extra_args.append('unique=True')
         return 'Index({0!r}, {1})'.format(index.name, ', '.join(extra_args))
 
+
+    def render_sequence(self, sequence_name):
+        return f"Sequence('{sequence_name}')"
+
     def render_column(self, column, show_name):
         kwarg = []
         is_sole_pk = column.primary_key and len(column.table.primary_key) == 1
@@ -570,6 +588,7 @@ class CodeGenerator(object):
                                      for i in column.table.indexes)
         has_index = any(set(i.columns) == {column} for i in column.table.indexes)
         server_default = None
+        sequence_name = None
 
         # Render the column type if there are no foreign keys on it or any of them points back to
         # itself
@@ -599,7 +618,17 @@ class CodeGenerator(object):
         elif column.server_default:
             # The quote escaping does not cover pathological cases but should mostly work
             default_expr = self._get_compiled_expression(column.server_default.arg)
-            if '\n' in default_expr:
+            if "nextval" in default_expr:
+                if column.primary_key:
+                # sequence currently not available in reflect,
+                # but will be in next sqlachemy https://github.com/sqlalchemy/sqlalchemy/commit/8dcf876fe9a06f3360b8d260459cdff050b2aa00#diff-cad7acf3ca251ebe73278ab655a40214
+                    server_default = None
+                else:
+                    server_default = 'server_default=text("{0}")'.format(default_expr)
+                    sequence_name = self._get_sequence_name(default_expr)
+
+
+            elif '\n' in default_expr:
                 server_default = 'server_default=text("""\\\n{0}""")'.format(default_expr)
             else:
                 default_expr = default_expr.replace('"', '\\"')
@@ -611,6 +640,7 @@ class CodeGenerator(object):
             ([self.render_column_type(column.type)] if render_coltype else []) +
             [self.render_constraint(x) for x in dedicated_fks] +
             [repr(x) for x in column.constraints] +
+            ([self.render_sequence(sequence_name)] if sequence_name else []) +
             ['{0}={1}'.format(k, repr(getattr(column, k))) for k in kwarg] +
             ([server_default] if server_default else []) +
             (['comment={!r}'.format(comment)] if comment and not self.nocomments else [])
@@ -733,3 +763,27 @@ class CodeGenerator(object):
             metadata_declarations=self.render_metadata_declarations(),
             models=self.model_separator.join(rendered_models).rstrip('\n'))
         print(output, file=outfile)
+
+    def render_multifile(self, outdir):
+        # Make sure we keep the declarative_base import
+        # before re-initialize the collector object for each model
+        sqlalchemy_ext_declarative = self.collector['sqlalchemy.ext.declarative']
+        for model in self.models:
+
+            # Create new collector and add back the declarative_base import
+            self.collector = ImportCollector()
+            self.collector['sqlalchemy.ext.declarative'] = sqlalchemy_ext_declarative
+
+            # Regenerate imports for each model
+            model.add_imports(self.collector)
+            if isinstance(model, self.class_model):
+                outfile = io.open(outdir + model.table_name + ".py", 'w', encoding='utf-8')
+                rendered_model = self.render_class(model)
+            elif isinstance(model, self.table_model):
+                outfile = io.open(outdir + model.name + ".py", 'w', encoding='utf-8')
+                rendered_model = self.render_table(model)
+            output = self.template.format(
+                imports=self.render_imports(),
+                metadata_declarations=self.render_base_import(),
+                models=rendered_model)
+            print(output, file=outfile)

@@ -7,6 +7,7 @@ import sys
 import pkg_resources
 from sqlalchemy.engine import create_engine
 from sqlalchemy.schema import MetaData
+from pathlib import Path
 
 from sqlacodegen.codegen import CodeGenerator
 
@@ -29,6 +30,9 @@ def main():
                         help="don't generate classes, only tables")
     parser.add_argument('--nocomments', action='store_true', help="don't render column comments")
     parser.add_argument('--outfile', help='file to write output to (default: stdout)')
+    parser.add_argument('--outdir', help='directory to write output to (only used for multifile)')
+    parser.add_argument('--multifile', action='store_true',
+                        help='export each model/table to a separate file')
     args = parser.parse_args()
 
     if args.version:
@@ -50,4 +54,8 @@ def main():
     outfile = io.open(args.outfile, 'w', encoding='utf-8') if args.outfile else sys.stdout
     generator = CodeGenerator(metadata, args.noindexes, args.noconstraints, args.nojoined,
                               args.noinflect, args.noclasses, nocomments=args.nocomments)
-    generator.render(outfile)
+    if args.multifile:
+        outdir = args.outdir if args.outdir else Path(__file__).resolve()
+        generator.render_multifile(outdir)
+    else:
+        generator.render(outfile)
