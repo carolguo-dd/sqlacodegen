@@ -9,7 +9,7 @@ from sqlalchemy.engine import create_engine
 from sqlalchemy.schema import MetaData
 from pathlib import Path
 
-from sqlacodegen.codegen import CodeGenerator
+from codegen import CodeGenerator
 
 
 def main():
@@ -59,3 +59,6 @@ def main():
         generator.render_multifile(outdir)
     else:
         generator.render(outfile)
+
+if __name__ == '__main__':
+    main()

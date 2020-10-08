@@ -14,7 +14,7 @@ import sqlalchemy
 import sqlalchemy.exc
 from sqlalchemy import (
     Enum, ForeignKeyConstraint, PrimaryKeyConstraint, CheckConstraint, UniqueConstraint, Table,
-    Column, Float, Sequence)
+    Column, Float, Sequence, Text)
 from sqlalchemy.schema import ForeignKey
 from sqlalchemy.sql.sqltypes import NullType
 from sqlalchemy.types import Boolean, String
@@ -149,6 +149,8 @@ class Model(object):
 
         for column in self.table.columns:
             collector.add_import(column.type)
+            if not isinstance(column.type, Text) and repr(column.type).find('Text()') > -1:
+                collector.add_import(Text)
             if column.server_default:
                 if Computed and isinstance(column.server_default, Computed):
                     collector.add_literal_import('sqlalchemy', 'Computed')
@@ -164,18 +166,18 @@ class Model(object):
 
         for constraint in sorted(self.table.constraints, key=_get_constraint_sort_key):
             if isinstance(constraint, ForeignKeyConstraint):
-                if len(constraint.columns) > 1:
+                if len(constraint.columns) > 0:
                     collector.add_literal_import('sqlalchemy', 'ForeignKeyConstraint')
                 else:
                     collector.add_literal_import('sqlalchemy', 'ForeignKey')
             elif isinstance(constraint, UniqueConstraint):
-                if len(constraint.columns) > 1:
+                if len(constraint.columns) > 0:
                     collector.add_literal_import('sqlalchemy', 'UniqueConstraint')
             elif not isinstance(constraint, PrimaryKeyConstraint):
                 collector.add_import(constraint)
 
         for index in self.table.indexes:
-            if len(index.columns) > 1:
+            if len(index.columns) > 0:
                 collector.add_import(index)
 
     @staticmethod
@@ -207,6 +209,7 @@ class ModelClass(Model):
         self.name = self._tablename_to_classname(table.name, inflect_engine)
         self.children = []
         self.attributes = OrderedDict()
+        self.table_name = table.name
 
         # Assign attribute names for columns
         for column in table.columns:
@@ -395,6 +398,8 @@ class CodeGenerator(object):
         classes = {}
         for table in metadata.sorted_tables:
             # Support for Alembic and sqlalchemy-migrate -- never expose the schema version tables
+            if table.name == 'pg_buffercache':
+                print('test')
             if table.name in self.ignored_tables:
                 continue
 
@@ -475,6 +480,10 @@ class CodeGenerator(object):
             return 'Base = declarative_base()\nmetadata = Base.metadata'
         return 'metadata = MetaData()'
 
+    def render_base_import(self):
+        if 'sqlalchemy.ext.declarative' in self.collector:
+            return 'from ..base import *'
+
     def _get_compiled_expression(self, statement):
         """Return the statement in a form where any placeholders have been filled in."""
         return str(statement.compile(
@@ -543,7 +552,7 @@ class CodeGenerator(object):
     def render_constraint(self, constraint):
         def render_fk_options(*opts):
             opts = [repr(opt) for opt in opts]
-            for attr in 'ondelete', 'onupdate', 'deferrable', 'initially', 'match':
+            for attr in 'ondelete', 'onupdate', 'deferrable', 'initially', 'match', 'name':
                 value = getattr(constraint, attr, None)
                 if value:
                     opts.append('{0}={1!r}'.format(attr, value))
@@ -561,17 +570,35 @@ class CodeGenerator(object):
             return 'ForeignKeyConstraint({0})'.format(
                 render_fk_options(local_columns, remote_columns))
         elif isinstance(constraint, CheckConstraint):
-            return 'CheckConstraint({0!r})'.format(
-                self._get_compiled_expression(constraint.sqltext))
+            constraint_expression = self._get_compiled_expression(constraint.sqltext)
+
+            return 'CheckConstraint({0!r}, name="{1}")'.format(constraint_expression, getattr(constraint, 'name', None))
         elif isinstance(constraint, UniqueConstraint):
             columns = [repr(col.name) for col in constraint.columns]
-            return 'UniqueConstraint({0})'.format(', '.join(columns))
+            return 'UniqueConstraint({0}, name="{1}")'.format(', '.join(columns), getattr(constraint, 'name', None))
 
     @staticmethod
     def render_index(index):
-        extra_args = [repr(col.name) for col in index.columns]
+        extra_args = []
+        i = 0
+        for col in index.columns:
+            if "DESC" in str(index.expressions[i]):
+                extra_args.append(col.name + ".desc()")
+            else:
+                extra_args.append(repr(col.name))
+            i = i + 1
         if index.unique:
             extra_args.append('unique=True')
+        # partial index predicate is ignored
+        # and this will be fixed in https://github.com/sqlalchemy/sqlalchemy/commit/69502725db4829a84872697fd6569631d2a3c47f
+        if index.kwargs.items():
+            index_options = []
+            for key, val in index.kwargs.items():
+                if key == 'postgresql_where':
+                    index_options.append('%s=text("%s")' % (key, val))
+                else:
+                    index_options.append('%s="%s"' % (key, val))
+            extra_args.append(", ".join(index_options))
         return 'Index({0!r}, {1})'.format(index.name, ', '.join(extra_args))
 
 
@@ -582,11 +609,14 @@ class CodeGenerator(object):
         kwarg = []
         is_sole_pk = column.primary_key and len(column.table.primary_key) == 1
         dedicated_fks = [c for c in column.foreign_keys if len(c.constraint.columns) == 1]
-        is_unique = any(isinstance(c, UniqueConstraint) and set(c.columns) == {column}
+        is_unique_constraint = any(isinstance(c, UniqueConstraint) and set(c.columns) == {column}
                         for c in column.table.constraints)
-        is_unique = is_unique or any(i.unique and set(i.columns) == {column}
+        is_unique_index = any(i.unique and set(i.columns) == {column}
                                      for i in column.table.indexes)
-        has_index = any(set(i.columns) == {column} for i in column.table.indexes)
+        # only use unique when there's a unique constraint on the column
+        # unique indexes will be created seperately in render_index function
+        is_unique = is_unique_constraint
+        # has_index = any(set(i.columns) == {column} for i in column.table.indexes)
         server_default = None
         sequence_name = None
 
@@ -598,14 +628,20 @@ class CodeGenerator(object):
             kwarg.append('key')
         if column.primary_key:
             kwarg.append('primary_key')
+            # if column type is integer and primary key but does not have server default
+            if is_sole_pk and isinstance(column.type, sqlalchemy.types.Integer):
+                if not column.server_default:
+                    kwarg.append('autoincrement')
+
+
         if not column.nullable and not is_sole_pk:
             kwarg.append('nullable')
         if is_unique:
             column.unique = True
             kwarg.append('unique')
-        elif has_index:
-            column.index = True
-            kwarg.append('index')
+        # elif has_index:
+        #     column.index = True
+        #     kwarg.append('index')
 
         if Computed and isinstance(column.server_default, Computed):
             expression = self._get_compiled_expression(column.server_default.sqltext)
@@ -637,8 +673,8 @@ class CodeGenerator(object):
         comment = getattr(column, 'comment', None)
         return 'Column({0})'.format(', '.join(
             ([repr(column.name)] if show_name else []) +
-            ([self.render_column_type(column.type)] if render_coltype else []) +
-            [self.render_constraint(x) for x in dedicated_fks] +
+            ([self.render_column_type(column.type)]) +
+            # [self.render_constraint(x) for x in dedicated_fks] +
             [repr(x) for x in column.constraints] +
             ([self.render_sequence(sequence_name)] if sequence_name else []) +
             ['{0}={1}'.format(k, repr(getattr(column, k))) for k in kwarg] +
@@ -670,13 +706,13 @@ class CodeGenerator(object):
         for constraint in sorted(model.table.constraints, key=_get_constraint_sort_key):
             if isinstance(constraint, PrimaryKeyConstraint):
                 continue
-            if (isinstance(constraint, (ForeignKeyConstraint, UniqueConstraint)) and
-                    len(constraint.columns) == 1):
-                continue
+            # if (isinstance(constraint, (ForeignKeyConstraint, UniqueConstraint)) and
+            #         len(constraint.columns) == 1):
+            #     continue
             rendered += '{0}{1},\n'.format(self.indentation, self.render_constraint(constraint))
 
         for index in model.table.indexes:
-            if len(index.columns) > 1:
+            if len(index.columns) > 0:
                 rendered += '{0}{1},\n'.format(self.indentation, self.render_index(index))
 
         if model.schema:
@@ -693,17 +729,25 @@ class CodeGenerator(object):
         rendered = 'class {0}({1}):\n'.format(model.name, model.parent_name)
         rendered += '{0}__tablename__ = {1!r}\n'.format(self.indentation, model.table.name)
 
+        # Render columns
+        rendered += '\n'
+        for attr, column in model.attributes.items():
+            if isinstance(column, Column):
+                show_name = attr != column.name
+                rendered += '{0}{1} = {2}\n'.format(
+                    self.indentation, attr, self.render_column(column, show_name))
+
         # Render constraints and indexes as __table_args__
         table_args = []
         for constraint in sorted(model.table.constraints, key=_get_constraint_sort_key):
             if isinstance(constraint, PrimaryKeyConstraint):
                 continue
-            if (isinstance(constraint, (ForeignKeyConstraint, UniqueConstraint)) and
-                    len(constraint.columns) == 1):
-                continue
+            # if (isinstance(constraint, (ForeignKeyConstraint, UniqueConstraint)) and
+            #         len(constraint.columns) == 1):
+            #     continue
             table_args.append(self.render_constraint(constraint))
         for index in model.table.indexes:
-            if len(index.columns) > 1:
+            if len(index.columns) > 0:
                 table_args.append(self.render_index(index))
 
         table_kwargs = {}
@@ -727,14 +771,6 @@ class CodeGenerator(object):
             table_args_joined = ',\n{0}{0}'.format(self.indentation).join(table_args)
             rendered += '{0}__table_args__ = (\n{0}{0}{1}\n{0})\n'.format(
                 self.indentation, table_args_joined)
-
-        # Render columns
-        rendered += '\n'
-        for attr, column in model.attributes.items():
-            if isinstance(column, Column):
-                show_name = attr != column.name
-                rendered += '{0}{1} = {2}\n'.format(
-                    self.indentation, attr, self.render_column(column, show_name))
 
         # Render relationships
         if any(isinstance(value, Relationship) for value in model.attributes.values()):
